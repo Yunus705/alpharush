@@ -1,0 +1,11 @@
+/* very small styling */
+body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background: linear-gradient(180deg,#0a2540,#041022); color:#e6eef8; }
+.container { max-width:960px; margin:40px auto; padding:18px; }
+.card { background: rgba(255,255,255,0.03); padding:16px; border-radius:12px; box-shadow: 0 8px 30px rgba(2,6,23,0.6); }
+.btn { padding:8px 12px; border-radius:8px; cursor:pointer; border: none; }
+.btn-primary { background: #06b6d4; color:#052024; }
+.input { padding:8px 10px; border-radius:8px; border:1px solid rgba(255,255,255,0.04); background:transparent; color:inherit; }
+.players { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+.playerChip { padding:8px 10px; background: rgba(255,255,255,0.02); border-radius:999px; font-weight:600; }
+.small { font-size:13px; color:#94a3b8; }
+.header { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; }
