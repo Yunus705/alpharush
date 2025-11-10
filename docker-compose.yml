@@ -1,7 +1,8 @@
 version: "3.8"
 services:
   mongo:
-    image: mongo:6.0
+    image: mongo:6
+    container_name: alpharush_mongo
     restart: unless-stopped
     volumes:
       - mongo_data:/data/db
@@ -10,9 +11,10 @@ services:
 
   backend:
     build: ./backend
+    container_name: alpharush_backend
     restart: unless-stopped
     env_file:
-      - ./backend/.env.example
+      - ./backend/.env
     ports:
       - "5000:5000"
     depends_on:
@@ -20,6 +22,7 @@ services:
 
   frontend:
     build: ./frontend
+    container_name: alpharush_frontend
     restart: unless-stopped
     ports:
       - "3000:80"

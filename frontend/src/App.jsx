@@ -1,139 +1,230 @@
-import React, { useState, useEffect } from "react";
-import { io } from "socket.io-client";
+import React, { useEffect, useState, useRef } from 'react';
+import { io } from 'socket.io-client';
 
+// Auto-detect server: use REACT_APP_SERVER if provided, else same hostname port 5000 (EC2 case)
 const SERVER = process.env.REACT_APP_SERVER || (window.location.hostname === 'localhost' ? 'http://localhost:5000' : `http://${window.location.hostname}:5000`);
 const socket = io(SERVER, { transports: ['websocket','polling'] });
 
-export default function App() {
-  const [name, setName] = useState("");
-  const [roomId, setRoomId] = useState("");
-  const [joined, setJoined] = useState(false);
+export default function App(){
+  // stages: home, lobby, playing, results, final
+  const [stage, setStage] = useState('home');
+  const [name, setName] = useState('');
+  const [roomId, setRoomId] = useState('');
   const [room, setRoom] = useState(null);
-  const [letter, setLetter] = useState("-");
-  const [round, setRound] = useState(0);
-  const [answers, setAnswers] = useState({ Name: "", City: "", Thing: "", Animal: "" });
   const [players, setPlayers] = useState([]);
+  const [letter, setLetter] = useState('-');
+  const [round, setRound] = useState(0);
+  const [answers, setAnswers] = useState({ Name:'', City:'', Thing:'', Animal:'' });
+  const [submitted, setSubmitted] = useState(false);
+  const [grace, setGrace] = useState(0);
+  const graceRef = useRef(null);
   const [roundResults, setRoundResults] = useState(null);
   const [gameOver, setGameOver] = useState(false);
 
-  useEffect(() => {
-    socket.on("roomUpdate", r => {
+  useEffect(()=>{
+    socket.on('roomUpdate', r => {
       setRoom(r);
       setPlayers(r.players || []);
+      if(stage === 'home') setStage('lobby');
     });
-    socket.on("roundStarted", ({ round, letter }) => {
-      setRound(round); setLetter(letter); setRoundResults(null);
+    socket.on('roundStarted', ({ round, letter }) => {
+      setRound(round); setLetter(letter); setStage('playing'); setSubmitted(false); setRoundResults(null);
+      setAnswers({ Name:'', City:'', Thing:'', Animal:'' });
+      stopGrace();
     });
-    socket.on("playerSubmitted", () => { /* optional */ });
-    socket.on("roundScored", ({ round, roundScores, totals }) => {
-      // map totals to display
-      setRoundResults({ round, roundScores, totals });
+    socket.on('playerSubmitted', () => {
+      if(!graceRef.current) startGraceCountdown();
     });
-    socket.on("gameOver", ({ totals }) => {
-      setGameOver(true);
-      setRoundResults(null);
+    socket.on('roundScored', (payload) => {
+      setRoundResults(payload);
+      setStage('results');
+    });
+    socket.on('gameOver', ({ totals }) => {
       setPlayers(totals);
+      setGameOver(true);
+      setStage('final');
     });
+
     return () => {
-      socket.off("roomUpdate");
-      socket.off("roundStarted");
-      socket.off("playerSubmitted");
-      socket.off("roundScored");
-      socket.off("gameOver");
+      socket.off('roomUpdate'); socket.off('roundStarted'); socket.off('playerSubmitted'); socket.off('roundScored'); socket.off('gameOver');
     };
-  }, []);
+  },[stage]);
 
-  const createRoom = () => {
-    if (!roomId || !name) return alert("Room & name required");
-    socket.emit("createRoom", { roomId, name }, (res) => {
-      if (res && res.ok) {
-        setJoined(true); setRoom(res.room);
-      } else if (res && res.error) alert(res.error);
+  function createRoom(){
+    if(!roomId || !name) return alert('Room & name required');
+    socket.emit('createRoom', { roomId, name }, res => {
+      if(res && res.ok){ setStage('lobby'); setRoom(res.room); }
+      else alert(res && res.error ? res.error : 'Create failed');
     });
-  };
+  }
+  function joinRoom(){
+    if(!roomId || !name) return alert('Room & name required');
+    socket.emit('joinRoom', { roomId, name }, res => {
+      if(res && res.ok){ setStage('lobby'); setRoom(res.room); }
+      else alert(res && res.error ? res.error : 'Join failed');
+    });
+  }
+  function startGame(){
+    if(!room) return;
+    socket.emit('startGame', { roomId }, res => {
+      if(!(res && res.ok)) alert(res && res.error ? res.error : 'Start failed');
+    });
+  }
+  function submitAnswers(){
+    if(submitted) return;
+    socket.emit('submitAnswers', { roomId, round, answers }, res => {
+      if(res && res.ok) setSubmitted(true);
+      else alert('submit failed');
+    });
+    if(!graceRef.current) startGraceCountdown();
+  }
 
-  const joinRoom = () => {
-    if (!roomId || !name) return alert("Room & name required");
-    socket.emit("joinRoom", { roomId, name }, (res) => {
-      if (res && res.ok) { setJoined(true); setRoom(res.room); }
-      else if (res && res.error) alert(res.error);
-    });
-  };
+  function startGraceCountdown(){
+    setGrace(10);
+    graceRef.current = setInterval(()=> {
+      setGrace(g => {
+        if(g <= 1){
+          clearInterval(graceRef.current);
+          graceRef.current = null;
+          // force score (auto-submit) - server will compute blanks as empty
+          socket.emit('forceScore', { roomId, round });
+          return 0;
+        }
+        return g-1;
+      });
+    }, 1000);
+  }
+  function stopGrace(){
+    if(graceRef.current){ clearInterval(graceRef.current); graceRef.current = null; setGrace(0); }
+  }
+  function isHost(){ return room && room.hostSocket === socket.id; }
 
-  const startGame = () => { socket.emit("startGame", { roomId }); };
-  const submit = () => {
-    if (!round) return alert("No active round");
-    socket.emit("submitAnswers", { roomId, round, answers }, res => {
-      if (res && !res.ok) alert(res.error || "Submit failed");
-    });
-  };
+  function restart(){
+    // go to home
+    setStage('home'); setRoom(null); setPlayers([]); setRound(0); setLetter('-'); setGameOver(false);
+  }
 
   return (
     <div className="container">
       <div className="header">
-        <h1>AlphaRush</h1>
-        <div className="small">Round: {round} | Letter: {letter}</div>
+        <div>
+          <h1>AlphaRush Arena</h1>
+          <div className="small">Mobile-first • 26 rounds • Max players {process.env.REACT_APP_MAX_PLAYERS || 8}</div>
+        </div>
+        <div className="small">Round: <strong>{round}</strong> | Letter: <span className="score">{letter}</span></div>
       </div>
 
-      <div className="card">
-        {!joined ? (
-          <div>
-            <div style={{display:'flex', gap:8}}>
-              <input className="input" placeholder="Your name" value={name} onChange={e=>setName(e.target.value)} />
-              <input className="input" placeholder="Room id" value={roomId} onChange={e=>setRoomId(e.target.value)} />
-            </div>
-            <div style={{marginTop:10}}>
-              <button className="btn btn-primary" onClick={createRoom}>Create Room</button>
-              <button className="btn" style={{marginLeft:8}} onClick={joinRoom}>Join Room</button>
-            </div>
+      {/* HOME */}
+      {stage === 'home' && (
+        <div className="card center" style={{maxWidth:480, margin:'0 auto'}}>
+          <input className="input" placeholder="Your name" value={name} onChange={e=>setName(e.target.value)} />
+          <input className="input" placeholder="Room ID (like ABC1)" value={roomId} onChange={e=>setRoomId(e.target.value)} />
+          <div style={{display:'flex',gap:8,justifyContent:'center',marginTop:10}}>
+            <button className="btn btn-primary" onClick={createRoom}>Create Room</button>
+            <button className="btn" onClick={joinRoom}>Join Room</button>
           </div>
-        ) : (
-          <div>
-            <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
-              <div>
-                <div className="small">Room: <strong>{roomId}</strong></div>
-                <div className="small">Players:</div>
-                <div className="players">
-                  {players.map(p => <div key={p.socketId || p.name} className="playerChip">{p.name} ({p.score||0})</div>)}
-                </div>
-              </div>
-              <div>
-                <button className="btn btn-primary" onClick={startGame}>Start</button>
-              </div>
-            </div>
+          <div className="small" style={{marginTop:8}}>Share Room ID with friends. Open this page on mobile or desktop.</div>
+        </div>
+      )}
 
-            <hr style={{margin:'12px 0', borderColor:'rgba(255,255,255,0.03)'}} />
-
+      {/* LOBBY */}
+      {stage === 'lobby' && room && (
+        <div className="card">
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
             <div>
-              <div className="small">Write answers starting with letter: <strong>{letter}</strong></div>
-              <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginTop:8}}>
-                <input className="input" placeholder="Name" value={answers.Name} onChange={e=>setAnswers(a=>({...a, Name:e.target.value}))} />
-                <input className="input" placeholder="City" value={answers.City} onChange={e=>setAnswers(a=>({...a, City:e.target.value}))} />
-                <input className="input" placeholder="Thing" value={answers.Thing} onChange={e=>setAnswers(a=>({...a, Thing:e.target.value}))} />
-                <input className="input" placeholder="Animal" value={answers.Animal} onChange={e=>setAnswers(a=>({...a, Animal:e.target.value}))} />
-              </div>
-
-              <div style={{marginTop:10}}>
-                <button className="btn btn-primary" onClick={submit}>Submit Answers</button>
+              <div className="small">Room</div>
+              <h2>{room.roomId}</h2>
+              <div className="small">Host: {room.players && room.players[0] ? room.players[0].name : ''}</div>
+            </div>
+            <div>
+              <div className="small">Players</div>
+              <div className="players">
+                {players.map(p => <div key={p.socketId || p.name} className="playerChip">{p.name} <div className="small">({p.score||0})</div></div>)}
               </div>
             </div>
-
-            {roundResults && (
-              <div style={{marginTop:16}}>
-                <h3>Round {roundResults.round} Results</h3>
-                <div>
-                  {Object.entries(roundResults.roundScores || {}).map(([sid, pts]) => {
-                    const p = players.find(x=>x.socketId===sid) || players.find(x=>x.id===sid) || { name: sid };
-                    return <div key={sid}>{p.name}: {pts} pts</div>;
-                  })}
-                </div>
-              </div>
-            )}
+            <div style={{textAlign:'right'}}>
+              {isHost() ? <button className="btn btn-primary" onClick={startGame}>Start Game</button> : <div className="small">Waiting for host to start</div>}
+            </div>
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
-      <div style={{marginTop:12}} className="small">Note: This is a ready-to-run minimal UI. I can add a nicer theme, lobby chat, avatars, or host-controlled next-round behavior — tell me which you want next.</div>
+      {/* PLAYING */}
+      {stage === 'playing' && (
+        <div className="card center">
+          <div>
+            <div className="roundBadge small">Round {round} / 26</div>
+            <div className="bigLetter">{letter}</div>
+          </div>
+
+          <div style={{marginTop:12, maxWidth:720, marginLeft:'auto', marginRight:'auto'}}>
+            <div className="grid-2">
+              <input className="input" placeholder="Name" value={answers.Name} onChange={e=>setAnswers(a=>({...a, Name:e.target.value}))} />
+              <input className="input" placeholder="City" value={answers.City} onChange={e=>setAnswers(a=>({...a, City:e.target.value}))} />
+              <input className="input" placeholder="Thing" value={answers.Thing} onChange={e=>setAnswers(a=>({...a, Thing:e.target.value}))} />
+              <input className="input" placeholder="Animal" value={answers.Animal} onChange={e=>setAnswers(a=>({...a, Animal:e.target.value}))} />
+            </div>
+
+            <div style={{display:'flex',justifyContent:'center',gap:8,marginTop:12}}>
+              {!submitted ? <button className="btn btn-primary" onClick={submitAnswers}>Submit</button> : <div className="small">You submitted — waiting...</div>}
+              {grace > 0 && <div className="small">Grace: {grace}s</div>}
+            </div>
+            <div className="timerBar"><div className="timerFill" style={{width: `${(10 - grace) * 10}%`}}></div></div>
+          </div>
+        </div>
+      )}
+
+      {/* RESULTS */}
+      {stage === 'results' && roundResults && (
+        <div className="card">
+          <div className="center"><h2>Round {roundResults.round} Results</h2></div>
+          <div style={{marginTop:8}}>
+            <div style={{display:'grid',gap:8}}>
+              {roundResults.totals.map(p => {
+                const pts = (roundResults.roundScores && roundResults.roundScores[p.socketId]) || 0;
+                const ansObj = (roundResults.answers && roundResults.answers[p.socketId] && roundResults.answers[p.socketId].answers) || {};
+                return (
+                  <div key={p.socketId} className="resultsGrid card" style={{padding:10}}>
+                    <div>
+                      <div style={{fontWeight:700}}>{p.name}</div>
+                      <div className="small">Name: {ansObj.Name || '-'}</div>
+                      <div className="small">City: {ansObj.City || '-'}</div>
+                      <div className="small">Thing: {ansObj.Thing || '-'}</div>
+                      <div className="small">Animal: {ansObj.Animal || '-'}</div>
+                    </div>
+                    <div style={{textAlign:'right'}}>
+                      <div className="score">{pts} pts</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{display:'flex',justifyContent:'center',gap:8,marginTop:12}}>
+              {isHost() ? <button className="btn btn-primary" onClick={()=>socket.emit('forceScore',{ roomId, round })}>Next Round (Host)</button> : <div className="small">Waiting for host to continue...</div>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FINAL */}
+      {stage === 'final' && (
+        <div className="card center">
+          <h2>Final Leaderboard</h2>
+          <div style={{marginTop:10}}>
+            {players.slice().sort((a,b)=>b.score - a.score).map((p,i) => (
+              <div key={p.name} style={{display:'flex',justifyContent:'space-between',padding:'8px 10px',alignItems:'center'}}>
+                <div style={{fontWeight:700}}>{i+1}. {p.name}</div>
+                <div className="score">{p.score} pts</div>
+              </div>
+            ))}
+          </div>
+          <div style={{display:'flex',gap:8,marginTop:12}}>
+            <button className="btn" onClick={restart}>Exit / Home</button>
+          </div>
+        </div>
+      )}
+
+      <div style={{marginTop:12}} className="small center">AlphaRush Arena — play on mobile or desktop</div>
     </div>
   );
 }
