@@ -23,13 +23,15 @@ mongoose.connect(MONGO_URI).then(()=> console.log('Mongo connected')).catch(err=
 
 const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
 
+// helpers
 function pickLetter(used){
   const remaining = LETTERS.filter(l => !used.includes(l));
   if(remaining.length === 0) return null;
   return remaining[Math.floor(Math.random()*remaining.length)];
 }
 
-const answersMap = {}; // in-memory per-room answers: { roomId: { round: { socketId: {answers, submittedAt} } } }
+// In-memory answers map: { roomId: { round: { socketId: { answers, submittedAt }, _scored: bool } } }
+const answersMap = {};
 
 io.on('connection', socket => {
   console.log('conn', socket.id);
@@ -80,27 +82,38 @@ io.on('connection', socket => {
       if(room.hostSocket !== socket.id) return cb && cb({ ok:false, error:'Only host' });
 
       room.round = 1;
-      room.usedLetters = [];
-      const letter = pickLetter(room.usedLetters);
+      room.usedLetters = room.usedLetters || [];
+      const letter = pickLetter(room.usedLetters || []);
       room.usedLetters.push(letter);
       await room.save();
 
       answersMap[roomId] = {};
-      answersMap[roomId][room.round] = {};
+      answersMap[roomId][room.round] = { _scored: false };
       io.to(roomId).emit('roundStarted', { round: room.round, letter, rounds:26 });
       io.to(roomId).emit('roomUpdate', room);
       cb && cb({ ok:true });
     } catch(e){ console.error(e); cb && cb({ ok:false, error:'server error' }); }
   });
 
-  // submit answers
+  // update partial answers (real-time save while typing)
+  socket.on('updateAnswers', async ({ roomId, round, answers }, cb) => {
+    try {
+      if(!answersMap[roomId]) answersMap[roomId] = {};
+      if(!answersMap[roomId][round]) answersMap[roomId][round] = { _scored: false };
+      const prev = answersMap[roomId][round][socket.id] || {};
+      answersMap[roomId][round][socket.id] = { ...prev, answers }; // keep submittedAt if present
+      cb && cb({ ok:true });
+    } catch (e) { console.error(e); cb && cb({ ok:false }); }
+  });
+
+  // submit answers (explicit submit)
   socket.on('submitAnswers', async ({ roomId, round, answers }, cb) => {
     try {
       const room = await Room.findOne({ roomId });
       if(!room) return cb && cb({ ok:false, error:'No room' });
 
       if(!answersMap[roomId]) answersMap[roomId] = {};
-      if(!answersMap[roomId][round]) answersMap[roomId][round] = {};
+      if(!answersMap[roomId][round]) answersMap[roomId][round] = { _scored: false };
       answersMap[roomId][round][socket.id] = { answers, submittedAt: new Date() };
 
       // update player's lastSubmitAt
@@ -109,21 +122,52 @@ io.on('connection', socket => {
 
       io.to(roomId).emit('playerSubmitted', { socketId: socket.id, round });
 
-      // if all submitted -> score
-      const submittedCount = Object.keys(answersMap[roomId][round]).length;
+      // if all submitted -> score (but do not advance)
+      const submittedCount = Object.keys(answersMap[roomId][round]).filter(k => k !== '_scored').length;
       if(submittedCount >= room.players.length){
-        await scoreRound(roomId, round);
+        await scoreRound(roomId, round); // scores only
       }
       cb && cb({ ok:true });
     } catch(e){ console.error(e); cb && cb({ ok:false, error:'server error' }); }
   });
 
-  // force score (host or anyone) - used when grace ends to score remaining
+  // force score (host or auto grace) - will score but NOT advance to next round
   socket.on('forceScore', async ({ roomId, round }, cb) => {
     try {
       await scoreRound(roomId, round);
       cb && cb({ ok:true });
     } catch(e){ console.error(e); cb && cb({ ok:false }); }
+  });
+
+  // nextRound (host-triggered) -> starts the next round only when host clicks Next
+  socket.on('nextRound', async ({ roomId }, cb) => {
+    try {
+      const room = await Room.findOne({ roomId });
+      if(!room) return cb && cb({ ok:false, error:'No room' });
+      if(room.hostSocket !== socket.id) return cb && cb({ ok:false, error:'Only host' });
+
+      // increment round and pick next letter
+      room.round = (room.round || 0) + 1;
+      if(room.round > 26){
+        // game over
+        io.to(roomId).emit('gameOver', { totals: room.players.map(p => ({ name: p.name, score: p.score })) });
+        await room.save();
+        return cb && cb({ ok:true });
+      }
+
+      room.usedLetters = room.usedLetters || [];
+      const letter = pickLetter(room.usedLetters);
+      room.usedLetters.push(letter);
+      await room.save();
+
+      // prepare answers map for new round
+      if(!answersMap[roomId]) answersMap[roomId] = {};
+      answersMap[roomId][room.round] = { _scored: false };
+
+      io.to(roomId).emit('roundStarted', { round: room.round, letter, rounds:26 });
+      io.to(roomId).emit('roomUpdate', room);
+      cb && cb({ ok:true });
+    } catch(e){ console.error(e); cb && cb({ ok:false, error:'server error' }); }
   });
 
   socket.on('disconnecting', async () => {
@@ -139,14 +183,21 @@ io.on('connection', socket => {
   });
 });
 
-/* scoring + advancing */
+/* scoring (only scoring; no auto-advance) */
 async function scoreRound(roomId, round){
   const room = await Room.findOne({ roomId });
   if(!room) return;
+
+  // guard: skip if already scored
+  if(answersMap[roomId] && answersMap[roomId][round] && answersMap[roomId][round]._scored) {
+    console.log('Round already scored', roomId, round);
+    return;
+  }
+
   const answersForRound = (answersMap[roomId] && answersMap[roomId][round]) || {};
   const categories = ['Name','City','Thing','Animal'];
 
-  // category map: { category: { normalizedAnswer: [socketIds] } }
+  // build normalized category map
   const catMap = {};
   categories.forEach(c=> catMap[c] = {});
 
@@ -165,21 +216,26 @@ async function scoreRound(roomId, round){
 
   categories.forEach(cat => {
     Object.keys(catMap[cat]).forEach(k => {
-      if(k === '') return; // blank gives 0
+      if(k === '') return;
       const list = catMap[cat][k];
       const pts = list.length === 1 ? 10 : 5;
       list.forEach(pid => roundScores[pid] += pts);
     });
   });
 
-  // apply scores to room.players
+  // apply
   room.players.forEach(pl => {
     pl.score = (pl.score || 0) + (roundScores[pl.socketId] || 0);
   });
 
   await room.save();
 
-  // send round result (include submitted texts too)
+  // mark scored to prevent double scoring
+  if(!answersMap[roomId]) answersMap[roomId] = {};
+  if(!answersMap[roomId][round]) answersMap[roomId][round] = {};
+  answersMap[roomId][round]._scored = true;
+
+  // emit results + updated room (so leaderboard updates)
   io.to(roomId).emit('roundScored', {
     round,
     roundScores,
@@ -187,35 +243,7 @@ async function scoreRound(roomId, round){
     answers: answersMap[roomId][round] || {}
   });
 
-  // advance after short pause
-  setTimeout(async () => {
-    const r = await Room.findOne({ roomId });
-    r.round = (r.round || 1) + 1;
-    if(r.round > 26){
-      io.to(roomId).emit('gameOver', { totals: r.players.map(p => ({ name: p.name, score: p.score })) });
-      return;
-    }
-    const letter = pickNextLetterAndPush(r);
-    await r.save();
-    answersMap[roomId][r.round] = {};
-    io.to(roomId).emit('roundStarted', { round: r.round, letter, rounds: 26 });
-    io.to(roomId).emit('roomUpdate', r);
-  }, 3500);
-}
-
-function pickNextLetterAndPush(room){
-  const used = room.usedLetters || [];
-  let letter = pickLetter(used);
-  if(!letter) return null;
-  used.push(letter);
-  room.usedLetters = used;
-  return letter;
-}
-
-function pickLetter(used){
-  const remaining = LETTERS.filter(l => !used.includes(l));
-  if(remaining.length === 0) return null;
-  return remaining[Math.floor(Math.random()*remaining.length)];
+  io.to(roomId).emit('roomUpdate', room);
 }
 
 /* health */
