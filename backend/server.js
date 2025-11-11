@@ -95,18 +95,18 @@ io.on('connection', socket => {
     } catch(e){ console.error(e); cb && cb({ ok:false, error:'server error' }); }
   });
 
-  // update partial answers (real-time save while typing)
+  // update partial answers
   socket.on('updateAnswers', async ({ roomId, round, answers }, cb) => {
     try {
       if(!answersMap[roomId]) answersMap[roomId] = {};
       if(!answersMap[roomId][round]) answersMap[roomId][round] = { _scored: false };
       const prev = answersMap[roomId][round][socket.id] || {};
-      answersMap[roomId][round][socket.id] = { ...prev, answers }; // keep submittedAt if present
+      answersMap[roomId][round][socket.id] = { ...prev, answers };
       cb && cb({ ok:true });
     } catch (e) { console.error(e); cb && cb({ ok:false }); }
   });
 
-  // submit answers (explicit submit)
+  // submit answers
   socket.on('submitAnswers', async ({ roomId, round, answers }, cb) => {
     try {
       const room = await Room.findOne({ roomId });
@@ -116,22 +116,20 @@ io.on('connection', socket => {
       if(!answersMap[roomId][round]) answersMap[roomId][round] = { _scored: false };
       answersMap[roomId][round][socket.id] = { answers, submittedAt: new Date() };
 
-      // update player's lastSubmitAt
       const pl = room.players.find(p => p.socketId === socket.id);
       if(pl){ pl.lastSubmitAt = new Date(); await room.save(); }
 
       io.to(roomId).emit('playerSubmitted', { socketId: socket.id, round });
 
-      // if all submitted -> score (but do not advance)
       const submittedCount = Object.keys(answersMap[roomId][round]).filter(k => k !== '_scored').length;
       if(submittedCount >= room.players.length){
-        await scoreRound(roomId, round); // scores only
+        await scoreRound(roomId, round);
       }
       cb && cb({ ok:true });
     } catch(e){ console.error(e); cb && cb({ ok:false, error:'server error' }); }
   });
 
-  // force score (host or auto grace) - will score but NOT advance to next round
+  // force score
   socket.on('forceScore', async ({ roomId, round }, cb) => {
     try {
       await scoreRound(roomId, round);
@@ -139,17 +137,15 @@ io.on('connection', socket => {
     } catch(e){ console.error(e); cb && cb({ ok:false }); }
   });
 
-  // nextRound (host-triggered) -> starts the next round only when host clicks Next
+  // nextRound (host-triggered)
   socket.on('nextRound', async ({ roomId }, cb) => {
     try {
       const room = await Room.findOne({ roomId });
       if(!room) return cb && cb({ ok:false, error:'No room' });
       if(room.hostSocket !== socket.id) return cb && cb({ ok:false, error:'Only host' });
 
-      // increment round and pick next letter
       room.round = (room.round || 0) + 1;
       if(room.round > 26){
-        // game over
         io.to(roomId).emit('gameOver', { totals: room.players.map(p => ({ name: p.name, score: p.score })) });
         await room.save();
         return cb && cb({ ok:true });
@@ -160,7 +156,6 @@ io.on('connection', socket => {
       room.usedLetters.push(letter);
       await room.save();
 
-      // prepare answers map for new round
       if(!answersMap[roomId]) answersMap[roomId] = {};
       answersMap[roomId][room.round] = { _scored: false };
 
@@ -183,31 +178,35 @@ io.on('connection', socket => {
   });
 });
 
-/* scoring (only scoring; no auto-advance) */
-async function scoreRound(roomId, round){
+/* ✅ scoring logic updated */
+async function scoreRound(roomId, round) {
   const room = await Room.findOne({ roomId });
-  if(!room) return;
+  if (!room) return;
 
-  // guard: skip if already scored
-  if(answersMap[roomId] && answersMap[roomId][round] && answersMap[roomId][round]._scored) {
+  if (answersMap[roomId] && answersMap[roomId][round] && answersMap[roomId][round]._scored) {
     console.log('Round already scored', roomId, round);
     return;
   }
 
   const answersForRound = (answersMap[roomId] && answersMap[roomId][round]) || {};
-  const categories = ['Name','City','Thing','Animal'];
+  const categories = ['Name', 'City', 'Thing', 'Animal'];
 
-  // build normalized category map
+  // find current round letter
+  const currentLetter = (room.usedLetters || [])[round - 1] || '';
+
   const catMap = {};
-  categories.forEach(c=> catMap[c] = {});
+  categories.forEach(c => catMap[c] = {});
 
   room.players.forEach(pl => {
     const ent = answersForRound[pl.socketId] || { answers: {} };
     const raw = ent.answers || {};
     categories.forEach(cat => {
-      const v = (raw[cat] || '').trim().toLowerCase();
-      if(!catMap[cat][v]) catMap[cat][v] = [];
-      catMap[cat][v].push(pl.socketId);
+      let v = (raw[cat] || '').trim();
+      if (v.length >= 3 && v[0].toUpperCase() === currentLetter.toUpperCase()) {
+        const lower = v.toLowerCase();
+        if (!catMap[cat][lower]) catMap[cat][lower] = [];
+        catMap[cat][lower].push(pl.socketId);
+      }
     });
   });
 
@@ -216,30 +215,31 @@ async function scoreRound(roomId, round){
 
   categories.forEach(cat => {
     Object.keys(catMap[cat]).forEach(k => {
-      if(k === '') return;
+      if (k === '') return;
       const list = catMap[cat][k];
       const pts = list.length === 1 ? 10 : 5;
       list.forEach(pid => roundScores[pid] += pts);
     });
   });
 
-  // apply
   room.players.forEach(pl => {
     pl.score = (pl.score || 0) + (roundScores[pl.socketId] || 0);
   });
 
   await room.save();
 
-  // mark scored to prevent double scoring
-  if(!answersMap[roomId]) answersMap[roomId] = {};
-  if(!answersMap[roomId][round]) answersMap[roomId][round] = {};
+  if (!answersMap[roomId]) answersMap[roomId] = {};
+  if (!answersMap[roomId][round]) answersMap[roomId][round] = {};
   answersMap[roomId][round]._scored = true;
 
-  // emit results + updated room (so leaderboard updates)
   io.to(roomId).emit('roundScored', {
     round,
     roundScores,
-    totals: room.players.map(p => ({ socketId: p.socketId, name: p.name, score: p.score })),
+    totals: room.players.map(p => ({
+      socketId: p.socketId,
+      name: p.name,
+      score: p.score
+    })),
     answers: answersMap[roomId][round] || {}
   });
 
