@@ -10,7 +10,7 @@ services:
       - "27017:27017"
 
   backend:
-    image: yunus05/alpharush_backend:v2
+    build: ./backend
     container_name: alpharush_backend
     restart: unless-stopped
     env_file:
@@ -21,7 +21,7 @@ services:
       - mongo
 
   frontend:
-    image: yunus05/alpharush_frontend:v2
+    build: ./frontend
     container_name: alpharush_frontend
     restart: unless-stopped
     ports:

@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 
-// Auto-detect server
+// Auto-detect server (works for localhost and EC2 with public IP)
 const SERVER = process.env.REACT_APP_SERVER || (window.location.hostname === 'localhost' ? 'http://localhost:5000' : `http://${window.location.hostname}:5000`);
 const socket = io(SERVER, { transports: ['websocket','polling'] });
 
@@ -18,8 +18,6 @@ export default function App(){
   const [grace, setGrace] = useState(0);
   const [roundResults, setRoundResults] = useState(null);
   const graceRef = useRef(null);
-
-  // debounce timer for updateAnswers
   const draftTimer = useRef(null);
 
   useEffect(() => {
@@ -46,6 +44,7 @@ export default function App(){
     socket.on('roundScored', payload => {
       setRoundResults(payload);
       setStage('results');
+      stopGrace();
     });
 
     socket.on('gameOver', ({ totals }) => {
@@ -84,11 +83,10 @@ export default function App(){
     });
   }
 
-  // Input change -> updateAnswers (debounced)
+  // handle input change + debounced updateAnswers
   function handleChange(field, val){
     setAnswers(a => ({ ...a, [field]: val }));
 
-    // debounce sending drafts to server (300ms)
     if(draftTimer.current) clearTimeout(draftTimer.current);
     draftTimer.current = setTimeout(() => {
       socket.emit('updateAnswers', { roomId, round, answers: { ...answers, [field]: val } });
@@ -96,7 +94,7 @@ export default function App(){
     }, 250);
   }
 
-  // Submit explicit
+  // explicit submit
   function submitAnswers(){
     if(submitted) return;
     socket.emit('submitAnswers', { roomId, round, answers }, res => {
@@ -106,8 +104,9 @@ export default function App(){
     if(!graceRef.current) startGraceCountdown();
   }
 
-  // Grace timer logic (when first player submits)
+  // grace countdown (starts when first submit occurs)
   function startGraceCountdown(){
+    if(graceRef.current) return;
     setGrace(10);
     graceRef.current = setInterval(() => {
       setGrace(g => {
@@ -132,7 +131,7 @@ export default function App(){
 
   function nextRoundByHost(){
     socket.emit('nextRound', { roomId }, res => {
-      if(res && !res.ok) alert(res.error || 'Next failed');
+      if (res && !res.ok) alert(res.error || 'Next failed');
     });
   }
 
@@ -140,7 +139,36 @@ export default function App(){
     setStage('home'); setRoom(null); setPlayers([]); setRound(0); setLetter('-'); setRoundResults(null);
   }
 
-  // render
+  // host invalidation toggle
+  function invalidateAnswer(targetSocketId, category, invalidate) {
+    if (!room) return;
+    socket.emit('invalidateAnswer', { roomId, round, targetSocketId, category, invalidate }, res => {
+      if (res && !res.ok) alert(res.error || 'Action failed');
+      // server will emit updated 'roundScored' and 'roomUpdate'
+    });
+  }
+
+  // download CSV (host)
+  async function downloadAnswersCSV() {
+    try {
+      const url = `${SERVER.replace(/\/$/, '')}/export/${roomId}`;
+      const resp = await fetch(url);
+      if (!resp.ok) return alert('Export failed');
+      const blob = await resp.blob();
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `alpharush_${roomId}_answers.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(link.href);
+    } catch (e) {
+      console.error(e);
+      alert('Export error');
+    }
+  }
+
+  // render UI
   return (
     <div className="container">
       <div className="header">
@@ -151,7 +179,6 @@ export default function App(){
         <div className="small">Round: <strong>{round}</strong> | Letter: <span className="score">{letter}</span></div>
       </div>
 
-      {/* layout: game + leaderboard */}
       <div className={ (stage === 'playing' || stage === 'results' || stage === 'lobby') ? 'game-with-leaderboard' : '' }>
 
         <div>
@@ -208,7 +235,11 @@ export default function App(){
 
                 <div style={{ display:'flex', justifyContent:'center', gap:8, marginTop:12 }}>
                   {!submitted ? <button className="btn btn-primary" onClick={submitAnswers}>Submit</button> : <div className="small">You submitted — waiting...</div>}
-                  {grace > 0 && <div className="small">Grace: {grace}s</div>}
+                  {grace > 0 && (
+                    <div className="small" style={{ fontWeight:'bold', color:'#22c55e' }}>
+                      Countdown: {grace}s
+                    </div>
+                  )}
                 </div>
 
                 <div className="timerBar"><div className="timerFill" style={{ width: `${(10 - grace) * 10}%` }} /></div>
@@ -224,16 +255,35 @@ export default function App(){
                 <div style={{ display:'grid', gap:8 }}>
                   {roundResults.totals.map(p => {
                     const pts = (roundResults.roundScores && roundResults.roundScores[p.socketId]) || 0;
-                    const ans = (roundResults.answers && roundResults.answers[p.socketId] && roundResults.answers[p.socketId].answers) || {};
+                    const ansObj = (roundResults.answers && roundResults.answers[p.socketId] && roundResults.answers[p.socketId].answers) || {};
                     return (
                       <div key={p.socketId} className="resultsGrid card" style={{ padding:10 }}>
                         <div>
                           <div style={{ fontWeight:700 }}>{p.name}</div>
-                          <div className="small">Name: {ans.Name || '-'}</div>
-                          <div className="small">City: {ans.City || '-'}</div>
-                          <div className="small">Thing: {ans.Thing || '-'}</div>
-                          <div className="small">Animal: {ans.Animal || '-'}</div>
+
+                          {['Name','City','Thing','Animal'].map(k => {
+                            const val = ansObj[k] || '-';
+                            const invalidFlag = (roundResults.answers && roundResults.answers[p.socketId] && roundResults.answers[p.socketId].invalid && roundResults.answers[p.socketId].invalid[k]) || false;
+                            return (
+                              <div key={k} className="small" style={{ display:'flex', alignItems:'center', gap:8 }}>
+                                <div style={{ textDecoration: invalidFlag ? 'line-through' : 'none', opacity: invalidFlag ? 0.55 : 1 }}>
+                                  {k}: {val || '-'}
+                                </div>
+
+                                {isHost() && (val && val !== '-') && (
+                                  <button
+                                    className="btn"
+                                    style={{ padding:'4px 8px', fontSize:12 }}
+                                    onClick={() => invalidateAnswer(p.socketId, k, !invalidFlag)}
+                                  >
+                                    {invalidFlag ? 'Undo' : 'Invalidate'}
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })}
                         </div>
+
                         <div style={{ textAlign:'right' }}>
                           <div className="score">{pts} pts</div>
                         </div>
@@ -262,14 +312,16 @@ export default function App(){
                   </div>
                 ))}
               </div>
+
               <div style={{ marginTop:12 }}>
                 <button className="btn" onClick={restart}>Exit / Restart</button>
+                {isHost() && <button className="btn btn-primary" onClick={downloadAnswersCSV} style={{ marginLeft: 8 }}>Download Answers CSV</button>}
               </div>
             </div>
           )}
         </div>
 
-        {/* LIVE LEADERBOARD (visible on lobby/playing/results) */}
+        {/* LIVE LEADERBOARD */}
         <div>
           {(stage === 'lobby' || stage === 'playing' || stage === 'results') && (
             <div className="leaderboard" style={{ position: 'sticky', top: 80 }}>
@@ -284,7 +336,6 @@ export default function App(){
             </div>
           )}
         </div>
-
       </div>
 
       <div style={{ marginTop:12 }} className="small center">AlphaRush Arena — play on mobile or desktop</div>
